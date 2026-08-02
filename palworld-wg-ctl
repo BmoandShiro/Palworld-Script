@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Privileged helper: bring NetworkManager WireGuard up/down.
+# Installed on the Deck as /home/deck/bin/palworld-wg-ctl (root-owned).
+# Invoked via passwordless sudo from palworld-wg.sh.
+set -euo pipefail
+
+CONF_CANDIDATES=(
+  "${PALWORLD_WG_CONF:-}"
+  /home/deck/.config/palworld-wg.conf
+  /etc/palworld-wg.conf
+)
+
+WG_CONNECTION="palworld-wg"
+
+for conf in "${CONF_CANDIDATES[@]}"; do
+  [[ -n "$conf" && -f "$conf" ]] || continue
+  # shellcheck disable=SC1090
+  source "$conf"
+  break
+done
+
+usage() {
+  echo "usage: $0 up|down|status" >&2
+  exit 2
+}
+
+[[ $# -eq 1 ]] || usage
+
+case "$1" in
+  up)
+    nmcli -w 30 connection up id "$WG_CONNECTION"
+    ;;
+  down)
+    nmcli connection down id "$WG_CONNECTION" || true
+    ;;
+  status)
+    if nmcli -t -f NAME connection show --active | grep -Fxq "$WG_CONNECTION"; then
+      echo "active"
+      exit 0
+    fi
+    echo "inactive"
+    exit 1
+    ;;
+  *)
+    usage
+    ;;
+esac
