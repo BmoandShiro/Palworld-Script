@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Privileged helper: bring NetworkManager WireGuard up/down.
+# Privileged helper: bring WireGuard up/down via wg-quick.
 # Installed on the Deck as /home/deck/bin/palworld-wg-ctl (root-owned).
 # Invoked via passwordless sudo from palworld-wg.sh.
+#
+# Expects /etc/wireguard/<WG_INTERFACE>.conf (default: wg0).
 set -euo pipefail
 
 CONF_CANDIDATES=(
@@ -10,7 +12,7 @@ CONF_CANDIDATES=(
   /etc/palworld-wg.conf
 )
 
-WG_CONNECTION="palworld-wg"
+WG_INTERFACE="wg0"
 
 for conf in "${CONF_CANDIDATES[@]}"; do
   [[ -n "$conf" && -f "$conf" ]] || continue
@@ -26,15 +28,25 @@ usage() {
 
 [[ $# -eq 1 ]] || usage
 
+iface_up() {
+  ip link show "$WG_INTERFACE" >/dev/null 2>&1
+}
+
 case "$1" in
   up)
-    nmcli -w 30 connection up id "$WG_CONNECTION"
+    if iface_up; then
+      echo "already up: $WG_INTERFACE"
+      exit 0
+    fi
+    wg-quick up "$WG_INTERFACE"
     ;;
   down)
-    nmcli connection down id "$WG_CONNECTION" || true
+    if iface_up; then
+      wg-quick down "$WG_INTERFACE" || true
+    fi
     ;;
   status)
-    if nmcli -t -f NAME connection show --active | grep -Fxq "$WG_CONNECTION"; then
+    if iface_up; then
       echo "active"
       exit 0
     fi

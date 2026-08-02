@@ -1,11 +1,11 @@
 # Palworld + WireGuard on Steam Deck (Game Mode)
 
-WireGuard stays **off** until you press Play on Palworld in Game Mode. A Steam launch script brings the tunnel up, starts the game, then tears WireGuard down when Palworld exits (including Force Quit / crash).
+WireGuard stays **off** until you press Play on Palworld in Game Mode. A Steam launch script brings the tunnel up (`wg-quick up wg0`), starts the game, then tears WireGuard down when Palworld exits (including Force Quit / crash).
 
-If WireGuard fails (bad sudoers, offline VPN endpoint, wrong connection name), **Palworld still launches** — you just will not be able to join the private server until the tunnel works. Check `~/.local/state/palworld-wg/launch.log` for `WARN` lines.
+If WireGuard fails (bad sudoers, offline endpoint, missing conf), **Palworld still launches** — you just will not be able to join the private server until the tunnel works. Check `~/.local/state/palworld-wg/launch.log` for `WARN` lines.
 
 ```
-Play Palworld → up wg (best effort) → wait for 10.8.0.1 → run game → down wg
+Play Palworld → wg-quick up wg0 (best effort) → wait for 10.8.0.1 → run game → wg-quick down
 ```
 
 ## Files in this folder
@@ -13,8 +13,8 @@ Play Palworld → up wg (best effort) → wait for 10.8.0.1 → run game → dow
 | File | Purpose |
 |------|---------|
 | `palworld-wg.sh` | Steam Launch Options wrapper (runs as `deck`) |
-| `palworld-wg-ctl` | Small helper that runs `nmcli` up/down (via passwordless sudo) |
-| `palworld-wg.conf` | Connection name + host IP |
+| `palworld-wg-ctl` | Helper that runs `wg-quick` up/down/status (via passwordless sudo) |
+| `palworld-wg.conf` | Interface name + host IP |
 | `sudoers.palworld-wg` | Passwordless sudo rule for the helper only |
 
 Copy all of these to the Deck (USB, scp, Discord, etc.).
@@ -24,7 +24,8 @@ Copy all of these to the Deck (USB, scp, Discord, etc.).
 ## Prerequisites
 
 - Steam Deck on SteamOS
-- WireGuard peer config for this Deck from your Relay / VPN UI (the `.conf` with `AllowedIPs = 10.8.0.1/32`)
+- Peer config installed as **`/etc/wireguard/wg0.conf`** (from Relay / VPN UI, `AllowedIPs = 10.8.0.1/32`)
+- `wg-quick` available (`wireguard-tools`)
 - Palworld installed in Steam
 - Comfort switching to **Desktop Mode** once for setup
 
@@ -37,49 +38,32 @@ Copy all of these to the Deck (USB, scp, Discord, etc.).
 
 ---
 
-## Step 2 — Import WireGuard into NetworkManager (once)
+## Step 2 — Confirm WireGuard config (once)
 
-### Option A — GUI
-
-1. Open **System Settings → Connections** (or Network)
-2. **+** → **Import VPN connection…**
-3. Select your Deck peer `.conf`
-4. Save
-
-### Option B — Terminal
+You should already have:
 
 ```bash
-nmcli connection import type wireguard file /path/to/your-deck-peer.conf
+sudo ls -l /etc/wireguard/wg0.conf
 ```
 
-List connections and note the name NetworkManager gave it:
+Manual activate / deactivate test:
 
 ```bash
-nmcli -t -f NAME,TYPE connection show | grep -i wireguard
-```
-
-**Rename it to match the script** (`palworld-wg`):
-
-```bash
-nmcli connection rename "OLD_NAME_HERE" palworld-wg
-```
-
-**Disable autoconnect** so the tunnel does not stay up at boot:
-
-```bash
-nmcli connection modify palworld-wg connection.autoconnect no
-nmcli connection down palworld-wg 2>/dev/null || true
-```
-
-Quick test (optional):
-
-```bash
-nmcli connection up palworld-wg
+sudo wg-quick up wg0
+sudo wg show
 ping -c 2 10.8.0.1
-nmcli connection down palworld-wg
+sudo wg-quick down wg0
 ```
 
-If ping fails but `nmcli connection show --active` lists `palworld-wg`, that can still be fine (some hosts block ICMP). Joining Palworld via `10.8.0.1` is the real test later.
+Do **not** enable `wg-quick@wg0` at boot — we only want the tunnel while Palworld runs.
+
+If `wg-quick` is missing:
+
+```bash
+sudo steamos-readonly disable
+sudo pacman -Sy wireguard-tools
+sudo steamos-readonly enable
+```
 
 ---
 
@@ -88,9 +72,8 @@ If ping fails but `nmcli connection show --active` lists `palworld-wg`, that can
 ```bash
 mkdir -p /home/deck/bin /home/deck/.config
 
-# If you copied this folder to Downloads:
-cd "/home/deck/Downloads/Palworld Script"
-# Or wherever you put these files.
+# Wherever you put these files, e.g.:
+cd ~/Palworld-Script-main
 
 cp palworld-wg.sh palworld-wg-ctl /home/deck/bin/
 cp palworld-wg.conf /home/deck/.config/palworld-wg.conf
@@ -98,21 +81,21 @@ cp palworld-wg.conf /home/deck/.config/palworld-wg.conf
 chmod 755 /home/deck/bin/palworld-wg.sh /home/deck/bin/palworld-wg-ctl
 ```
 
-Lock down the privileged helper so only root can change it (required for safe sudoers):
+Lock down the privileged helper (required for safe sudoers):
 
 ```bash
 sudo chown root:root /home/deck/bin/palworld-wg-ctl
 sudo chmod 755 /home/deck/bin/palworld-wg-ctl
 ```
 
-Edit the config if your NM name or host IP differs:
+Config (defaults are fine if the interface is `wg0`):
 
 ```bash
 nano /home/deck/.config/palworld-wg.conf
 ```
 
 ```conf
-WG_CONNECTION=palworld-wg
+WG_INTERFACE=wg0
 WG_HOST=10.8.0.1
 WAIT_SECONDS=30
 ```
@@ -122,8 +105,6 @@ WAIT_SECONDS=30
 ## Step 4 — Passwordless sudo (required for Game Mode)
 
 Game Mode cannot type a sudo password. Allow **only** the control helper:
-
-SteamOS is read-only by default. Unlock, install the rule, then lock again:
 
 ```bash
 sudo steamos-readonly disable
@@ -138,17 +119,21 @@ sudo visudo -cf /etc/sudoers.d/palworld-wg
 sudo steamos-readonly enable
 ```
 
-If `visudo` reports errors, **fix them before rebooting** (a bad sudoers file can break sudo).
+If `visudo` reports errors, **fix them before continuing**.
 
-Test with **no password prompt**:
+Test with **no password prompt** (`-n` = fail instead of asking):
 
 ```bash
+sudo -l
+
 sudo -n /home/deck/bin/palworld-wg-ctl up
 sudo -n /home/deck/bin/palworld-wg-ctl status
+sudo wg show
 sudo -n /home/deck/bin/palworld-wg-ctl down
 ```
 
-If you get `a password is required`, the sudoers file is wrong, not named correctly, or has bad permissions (must be `0440`).
+- Success: `status` prints `active`, `wg show` lists `wg0`, no password asked.
+- If you see `sudo: a password is required`, reinstall sudoers and `chown root:root` the ctl script again.
 
 ---
 
@@ -164,25 +149,16 @@ If you get `a password is required`, the sudoers file is wrong, not named correc
 
 Do not use `~/bin/...` — Steam may not expand `~`.
 
-Close Properties.
-
 ---
 
 ## Step 6 — Verify from Game Mode
 
 1. **Return to Gaming Mode**
 2. Launch **Palworld**
-3. Join your server at the WireGuard host (`10.8.0.1` / whatever Relay shows)
-4. Quit Palworld
-5. Optional check from Desktop later:
+3. Join the server at `10.8.0.1`
+4. Quit Palworld — tunnel should go down
 
-```bash
-nmcli -t -f NAME connection show --active | grep palworld-wg || echo "tunnel is down (good)"
-```
-
-### Logs
-
-If launch fails or the tunnel misbehaves:
+Logs:
 
 ```bash
 cat /home/deck/.local/state/palworld-wg/launch.log
@@ -192,13 +168,29 @@ cat /home/deck/.local/state/palworld-wg/launch.log
 
 ## How it works
 
-1. Steam runs `/home/deck/bin/palworld-wg.sh` with the real Palworld command as arguments (`%command%`).
-2. The script calls `sudo -n /home/deck/bin/palworld-wg-ctl up` → `nmcli connection up id palworld-wg`.
-3. It waits until the host responds (or the connection is active). If up or wait fails, it logs a `WARN` and continues.
-4. It starts Palworld as a child process (**not** `exec`), so an `EXIT` trap still runs when the game ends.
-5. On exit / crash / Force Quit, the trap runs `palworld-wg-ctl down`.
+1. Steam runs `/home/deck/bin/palworld-wg.sh` with the real Palworld command (`%command%`).
+2. The script calls `sudo -n /home/deck/bin/palworld-wg-ctl up` → `wg-quick up wg0`.
+3. It waits briefly for `10.8.0.1` (or an active `wg0`). If up/wait fails, it logs a `WARN` and continues.
+4. Palworld runs as a child process so an `EXIT` trap still fires.
+5. On exit / crash / Force Quit → `wg-quick down wg0`.
 
-WireGuard is **not** left connected between sessions. A VPN failure never aborts the Steam launch.
+---
+
+## Manual tunnel control (Desktop)
+
+```bash
+# up
+sudo -n /home/deck/bin/palworld-wg-ctl up
+# or: sudo wg-quick up wg0
+
+# status
+sudo -n /home/deck/bin/palworld-wg-ctl status
+sudo wg show
+
+# down
+sudo -n /home/deck/bin/palworld-wg-ctl down
+# or: sudo wg-quick down wg0
+```
 
 ---
 
@@ -206,21 +198,18 @@ WireGuard is **not** left connected between sessions. A VPN failure never aborts
 
 | Symptom | Fix |
 |---------|-----|
-| Game launches but cannot join server | Confirm `WG_HOST` / join IP is `10.8.0.1`. Confirm peer is still valid on the Relay. Test `sudo -n /home/deck/bin/palworld-wg-ctl up` then ping/join. |
-| Cannot join private server but game opens | WireGuard likely failed; read log for `WARN` / `ERROR`. Fix NM name or sudoers, then relaunch. |
-| Steam shows instant fail / black flash | Usually a bad Launch Options line (missing `%command%`), not WG. Check log and Properties. |
-| `password is required` | Reinstall `/etc/sudoers.d/palworld-wg`, mode `0440`, path must be exactly `/home/deck/bin/palworld-wg-ctl`. |
-| Connection name not found | `nmcli connection show` and rename to `palworld-wg`, or change `WG_CONNECTION` in the conf **and** keep ctl in sync (ctl reads the same conf). |
-| Tunnel stays up after quit | Trap failed; run `sudo -n /home/deck/bin/palworld-wg-ctl down` manually. Confirm you did **not** replace `%command%` incorrectly. |
-| SteamOS update broke sudoers | Re-run Step 4 after major OS updates if `/etc/sudoers.d/palworld-wg` disappeared. |
-| Edited `palworld-wg-ctl` and sudo refuses it | Re-apply `chown root:root` and `chmod 755` on the ctl script. |
+| `unknown connection 'palworld-wg'` | Old NM-based script. Re-copy updated `palworld-wg-ctl` / `palworld-wg.sh` from this folder (wg-quick version). |
+| `Unable to access interface: No such device` | Tunnel is down. Run `ctl up` or `sudo wg-quick up wg0`. |
+| Cannot join private server but game opens | WG failed; read log for `WARN`. Test `ctl up` + `ping 10.8.0.1`. |
+| `password is required` | Reinstall `/etc/sudoers.d/palworld-wg` (no `.` in filename), mode `0440`. `sudo -l` must show NOPASSWD for ctl. |
+| SteamOS update broke sudoers | Re-run Step 4. |
 
 ---
 
 ## Uninstall
 
 ```bash
-# Clear Launch Options in Steam first (empty the field)
+# Clear Launch Options in Steam first
 
 sudo steamos-readonly disable
 sudo rm -f /etc/sudoers.d/palworld-wg
@@ -229,11 +218,14 @@ sudo steamos-readonly enable
 rm -f /home/deck/bin/palworld-wg.sh /home/deck/bin/palworld-wg-ctl
 rm -f /home/deck/.config/palworld-wg.conf
 
-nmcli connection delete palworld-wg   # optional: remove VPN connection
+# Optional: remove peer config
+# sudo rm -f /etc/wireguard/wg0.conf
 ```
 
 ---
 
 ## Security note
 
-The sudoers rule lets the `deck` user run **only** `/home/deck/bin/palworld-wg-ctl` as root with no password. Keep that file **root-owned** and mode `755`. Do not point sudoers at a script the `deck` user can overwrite without re-checking ownership.
+The sudoers rule lets `deck` run **only** `/home/deck/bin/palworld-wg-ctl` as root with no password. Keep that file **root-owned** and mode `755`.
+
+Never paste `/etc/wireguard/wg0.conf` (it contains a private key) into chat or screenshots. If it was exposed, revoke/rotate that peer on the Relay and install a new conf.

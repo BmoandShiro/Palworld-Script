@@ -1,5 +1,8 @@
 # Install on Steam Deck as /etc/sudoers.d/palworld-wg
 # MUST be mode 0440 and owned by root.
+# Filename must NOT contain a '.' (sudo ignores dotted names in sudoers.d).
 #
-# Allows Game Mode (no password prompt) to run only the WG control helper.
-deck ALL=(root) NOPASSWD: /home/deck/bin/palworld-wg-ctl
+# Explicit args so Game Mode never asks for a password.
+deck ALL=(root) NOPASSWD: /home/deck/bin/palworld-wg-ctl up
+deck ALL=(root) NOPASSWD: /home/deck/bin/palworld-wg-ctl down
+deck ALL=(root) NOPASSWD: /home/deck/bin/palworld-wg-ctl status

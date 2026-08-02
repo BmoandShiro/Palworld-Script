@@ -4,8 +4,8 @@
 # Launch Options (exact):
 #   /home/deck/bin/palworld-wg.sh %command%
 #
-# Brings WireGuard up, waits for the game host, runs Palworld, then tears
-# the tunnel down on exit (including crash / Force Quit).
+# Brings WireGuard up (wg-quick), waits for the game host, runs Palworld,
+# then tears the tunnel down on exit (including crash / Force Quit).
 #
 # If WireGuard fails to connect, Palworld still launches (offline / local play).
 set -euo pipefail
@@ -16,9 +16,9 @@ CONF_CANDIDATES=(
   "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/palworld-wg.conf"
 )
 
-WG_CONNECTION="palworld-wg"
+WG_INTERFACE="wg0"
 WG_HOST="10.8.0.1"
-WAIT_SECONDS=30
+WAIT_SECONDS="30"
 CTL="${PALWORLD_WG_CTL:-/home/deck/bin/palworld-wg-ctl}"
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/palworld-wg"
 LOG="$LOG_DIR/launch.log"
@@ -36,48 +36,39 @@ log() {
   printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG" >&2
 }
 
-connection_active() {
-  nmcli -t -f NAME connection show --active 2>/dev/null | grep -Fxq "$WG_CONNECTION"
+iface_up() {
+  ip link show "$WG_INTERFACE" >/dev/null 2>&1
 }
 
 wg_up() {
-  if connection_active; then
-    log "WireGuard already active: $WG_CONNECTION"
+  if iface_up; then
+    log "WireGuard already active: $WG_INTERFACE"
     return 0
   fi
 
-  log "Bringing up WireGuard: $WG_CONNECTION"
+  log "Bringing up WireGuard: $WG_INTERFACE"
 
-  # Prefer passwordless privileged helper (works for system connections).
   if [[ -x "$CTL" ]] && sudo -n "$CTL" up; then
     return 0
   fi
 
-  # User-owned NM connections sometimes work without sudo.
-  if nmcli -w 30 connection up id "$WG_CONNECTION"; then
-    return 0
-  fi
-
-  log "WARN: failed to bring up '$WG_CONNECTION'."
-  log "Check: connection name, NM import, and passwordless sudo for $CTL"
+  log "WARN: failed to bring up '$WG_INTERFACE'."
+  log "Check: /etc/wireguard/${WG_INTERFACE}.conf and passwordless sudo for $CTL"
   return 1
 }
 
 wg_down() {
-  log "Bringing down WireGuard: $WG_CONNECTION"
+  log "Bringing down WireGuard: $WG_INTERFACE"
   if [[ -x "$CTL" ]] && sudo -n "$CTL" down; then
     return 0
   fi
-  nmcli connection down id "$WG_CONNECTION" >/dev/null 2>&1 || true
+  return 0
 }
 
 host_reachable() {
-  # ICMP may be blocked; treat success OR "WG active + brief settle" as OK.
   if command -v ping >/dev/null 2>&1; then
     ping -c 1 -W 1 "$WG_HOST" >/dev/null 2>&1 && return 0
   fi
-  # Fallback: UDP/TCP probe not required — presence of active connection is enough
-  # after handshake wait below.
   return 1
 }
 
@@ -89,10 +80,9 @@ wait_for_host() {
       log "Host reachable: $WG_HOST"
       return 0
     fi
-    if connection_active; then
-      # Give WireGuard a moment for handshake even if ping is filtered.
+    if iface_up; then
       sleep 2
-      if connection_active; then
+      if iface_up; then
         log "Tunnel active (ping to $WG_HOST failed or filtered; continuing)"
         return 0
       fi
