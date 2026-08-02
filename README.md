@@ -119,7 +119,7 @@ sudo visudo -cf /etc/sudoers.d/palworld-wg
 sudo steamos-readonly enable
 ```
 
-If `visudo` reports errors, **fix them before continuing**.
+The sudoers file includes `!requiretty` for the ctl command. That matters in **Game Mode**, where Steam launches the script with no terminal — without it, `sudo -n` can fail even though the same command works in Desktop Konsole.
 
 Test with **no password prompt** (`-n` = fail instead of asking):
 
@@ -198,10 +198,11 @@ sudo -n /home/deck/bin/palworld-wg-ctl down
 
 | Symptom | Fix |
 |---------|-----|
-| `unknown connection 'palworld-wg'` | Old NM-based script. Re-copy updated `palworld-wg-ctl` / `palworld-wg.sh` from this folder (wg-quick version). |
+| Works in Desktop, fails in Game Mode | Reinstall updated sudoers (includes `!requiretty`) and updated `palworld-wg.sh`. Relaunch once, then check log for `ctl up output:` / `ctl up exit=`. |
+| `unknown connection 'palworld-wg'` | Old NM-based script. Re-copy updated `palworld-wg-ctl` / `palworld-wg.sh` (wg-quick version). |
 | `Unable to access interface: No such device` | Tunnel is down. Run `ctl up` or `sudo wg-quick up wg0`. |
-| Cannot join private server but game opens | WG failed; read log for `WARN`. Test `ctl up` + `ping 10.8.0.1`. |
-| `password is required` | Reinstall `/etc/sudoers.d/palworld-wg` (no `.` in filename), mode `0440`. `sudo -l` must show NOPASSWD for ctl. |
+| Cannot join private server but game opens | WG failed; read log for `WARN` / `ctl up output`. Test `ctl up` + `ping 10.8.0.1`. |
+| `password is required` / `must have a tty` | Reinstall `/etc/sudoers.d/palworld-wg` from this folder (has NOPASSWD + `!requiretty`). |
 | SteamOS update broke sudoers | Re-run Step 4. |
 
 ---

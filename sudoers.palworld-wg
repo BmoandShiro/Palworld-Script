@@ -2,6 +2,9 @@
 # MUST be mode 0440 and owned by root.
 # Filename must NOT contain a '.' (sudo ignores dotted names in sudoers.d).
 #
+# Game Mode has no TTY — requiretty would break sudo -n from Steam launches.
+Defaults!/home/deck/bin/palworld-wg-ctl !requiretty
+
 # Explicit args so Game Mode never asks for a password.
 deck ALL=(root) NOPASSWD: /home/deck/bin/palworld-wg-ctl up
 deck ALL=(root) NOPASSWD: /home/deck/bin/palworld-wg-ctl down

@@ -20,6 +20,10 @@ WG_INTERFACE="wg0"
 WG_HOST="10.8.0.1"
 WAIT_SECONDS="30"
 CTL="${PALWORLD_WG_CTL:-/home/deck/bin/palworld-wg-ctl}"
+SUDO_BIN="${SUDO_BIN:-/usr/bin/sudo}"
+IP_BIN="${IP_BIN:-/usr/sbin/ip}"
+[[ -x "$IP_BIN" ]] || IP_BIN="/bin/ip"
+[[ -x "$IP_BIN" ]] || IP_BIN="$(command -v ip || true)"
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/palworld-wg"
 LOG="$LOG_DIR/launch.log"
 
@@ -37,7 +41,45 @@ log() {
 }
 
 iface_up() {
-  ip link show "$WG_INTERFACE" >/dev/null 2>&1
+  [[ -n "$IP_BIN" ]] && "$IP_BIN" link show "$WG_INTERFACE" >/dev/null 2>&1
+}
+
+run_ctl() {
+  local action="$1"
+  local out
+  local rc=0
+
+  if [[ ! -x "$CTL" ]]; then
+    log "ERROR: ctl missing or not executable: $CTL"
+    return 127
+  fi
+
+  if [[ ! -x "$SUDO_BIN" ]]; then
+    log "ERROR: sudo not found at $SUDO_BIN"
+    return 127
+  fi
+
+  # Capture stderr/stdout so Game Mode failures are visible in the log.
+  # env -i avoids Steam/Proton polluting sudo; keep a minimal PATH.
+  set +e
+  out="$(
+    env -i \
+      HOME="/home/deck" \
+      USER="deck" \
+      LOGNAME="deck" \
+      PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+      "$SUDO_BIN" -n "$CTL" "$action" 2>&1
+  )"
+  rc=$?
+  set -e
+
+  if [[ -n "$out" ]]; then
+    log "ctl $action output: $out"
+  fi
+  if [[ $rc -ne 0 ]]; then
+    log "ctl $action exit=$rc"
+  fi
+  return "$rc"
 }
 
 wg_up() {
@@ -48,21 +90,18 @@ wg_up() {
 
   log "Bringing up WireGuard: $WG_INTERFACE"
 
-  if [[ -x "$CTL" ]] && sudo -n "$CTL" up; then
+  if run_ctl up; then
     return 0
   fi
 
   log "WARN: failed to bring up '$WG_INTERFACE'."
-  log "Check: /etc/wireguard/${WG_INTERFACE}.conf and passwordless sudo for $CTL"
+  log "Check: /etc/wireguard/${WG_INTERFACE}.conf, sudoers (!requiretty), and: $SUDO_BIN -n $CTL up"
   return 1
 }
 
 wg_down() {
   log "Bringing down WireGuard: $WG_INTERFACE"
-  if [[ -x "$CTL" ]] && sudo -n "$CTL" down; then
-    return 0
-  fi
-  return 0
+  run_ctl down || true
 }
 
 host_reachable() {
