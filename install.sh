@@ -53,10 +53,58 @@ install -m 755 -T "${SCRIPT_DIR}/palworld-wg-ctl" "${BIN_DIR}/palworld-wg-ctl"
 echo "==> Overwriting ${CONF_DST}"
 install -m 644 -T "${SCRIPT_DIR}/palworld-wg.conf" "$CONF_DST"
 
-if [[ ! -f /etc/wireguard/wg0.conf ]]; then
-  echo
-  echo "WARNING: /etc/wireguard/wg0.conf not found."
-  echo "         Install your WireGuard peer config there before testing."
+find_peer_conf() {
+  local f
+  if [[ -n "${WG_PEER_CONF:-}" && -f "${WG_PEER_CONF}" ]]; then
+    printf '%s\n' "${WG_PEER_CONF}"
+    return 0
+  fi
+  for f in \
+    "${SCRIPT_DIR}/wg0.conf" \
+    "${HOME}/Downloads/wg0.conf" \
+    "${HOME}/Desktop/wg0.conf" \
+    "${HOME}/wg0.conf"
+  do
+    if [[ -f "$f" ]]; then
+      printf '%s\n' "$f"
+      return 0
+    fi
+  done
+  # Any .conf in the script folder that looks like WireGuard (has [Interface])
+  # except our helper palworld-wg.conf
+  while IFS= read -r -d '' f; do
+    [[ "$(basename "$f")" == "palworld-wg.conf" ]] && continue
+    if grep -q '^\[Interface\]' "$f" 2>/dev/null; then
+      printf '%s\n' "$f"
+      return 0
+    fi
+  done < <(find "${SCRIPT_DIR}" -maxdepth 1 -type f -name '*.conf' -print0 2>/dev/null)
+
+  local newest=""
+  local newest_m=0
+  local m
+  while IFS= read -r -d '' f; do
+    grep -q '^\[Interface\]' "$f" 2>/dev/null || continue
+    m=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
+    if (( m > newest_m )); then
+      newest_m=$m
+      newest=$f
+    fi
+  done < <(find "${HOME}/Downloads" -maxdepth 1 -type f \( -name '*.conf' -o -name '*.wg' \) -print0 2>/dev/null)
+
+  if [[ -n "$newest" ]]; then
+    printf '%s\n' "$newest"
+    return 0
+  fi
+
+  return 1
+}
+
+PEER_SRC=""
+if PEER_SRC="$(find_peer_conf)"; then
+  echo "==> Found WireGuard peer config: ${PEER_SRC}"
+else
+  PEER_SRC=""
 fi
 
 if [[ ! -x /usr/bin/wg-quick ]]; then
@@ -67,7 +115,23 @@ fi
 echo "==> Installing systemd path units + root helpers (sudo password once)"
 sudo steamos-readonly disable || true
 
-sudo mkdir -p "$LIB_DIR" "$UNIT_DIR"
+sudo mkdir -p "$LIB_DIR" "$UNIT_DIR" /etc/wireguard
+
+if [[ -n "$PEER_SRC" ]]; then
+  echo "==> Installing /etc/wireguard/wg0.conf (overwrite)"
+  sudo install -m 600 -o root -g root -T "$PEER_SRC" /etc/wireguard/wg0.conf
+elif [[ -f /etc/wireguard/wg0.conf ]]; then
+  echo "==> Keeping existing /etc/wireguard/wg0.conf"
+else
+  echo
+  echo "ERROR: No WireGuard peer config found."
+  echo "Put your Deck peer file in one of these places, then re-run:"
+  echo "  ${SCRIPT_DIR}/wg0.conf"
+  echo "  ~/Downloads/wg0.conf"
+  echo "Or:  WG_PEER_CONF=/path/to/peer.conf bash install.sh"
+  echo
+  echo "(Systemd units will still be installed so you only need the conf next.)"
+fi
 
 # Root-owned helpers invoked by systemd
 sudo install -m 755 -o root -g root -T \
@@ -91,6 +155,19 @@ sudo systemctl enable --now palworld-wg-up.path palworld-wg-down.path
 rm -f "${STATE_DIR}/want-up" "${STATE_DIR}/want-down"
 
 sudo steamos-readonly enable || true
+
+if [[ ! -f /etc/wireguard/wg0.conf ]]; then
+  echo
+  echo "Install partial: helpers/units OK, but tunnel test skipped (no wg0.conf)."
+  echo "After placing the peer conf, run:"
+  echo "  sudo steamos-readonly disable"
+  echo "  sudo mkdir -p /etc/wireguard"
+  echo "  sudo cp ~/Downloads/wg0.conf /etc/wireguard/wg0.conf"
+  echo "  sudo chmod 600 /etc/wireguard/wg0.conf"
+  echo "  sudo steamos-readonly enable"
+  echo "  /home/deck/bin/palworld-wg-ctl up"
+  exit 1
+fi
 
 echo "==> Testing tunnel bring-up WITHOUT sudo (Steam Play path)"
 "${BIN_DIR}/palworld-wg-ctl" down >/dev/null 2>&1 || true

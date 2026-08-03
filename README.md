@@ -28,10 +28,11 @@ Play → touch want-up → systemd runs wg-quick up → game → touch want-down
 
 ## Prerequisites
 
-- `/etc/wireguard/wg0.conf` installed
+- Deck peer `.conf` from Relay (WireGuard), saved as e.g. `~/Downloads/wg0.conf` or next to `install.sh` as `wg0.conf`
 - `wireguard-tools` (`/usr/bin/wg-quick`)
 - Palworld installed
 
+`install.sh` will copy that peer file to `/etc/wireguard/wg0.conf` automatically when it finds it.
 ---
 
 ## Install (one command)
