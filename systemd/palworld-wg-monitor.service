@@ -1,0 +1,14 @@
+[Unit]
+Description=Palworld WireGuard monitor (auto up/down wg0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/deck/.local/lib/palworld-wg/palworld-wg-monitor.sh
+Restart=always
+RestartSec=10
+Environment=PALWORLD_WG_INTERVAL=60
+
+[Install]
+WantedBy=multi-user.target
