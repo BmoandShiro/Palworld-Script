@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for Palworld WireGuard DOWN request
+
+[Path]
+PathExists=/home/deck/.local/state/palworld-wg/want-down
+Unit=palworld-wg-down.service
+
+[Install]
+WantedBy=multi-user.target

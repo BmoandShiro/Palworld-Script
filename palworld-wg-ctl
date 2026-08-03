@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Privileged helper for WireGuard on Steam Deck.
-# Prefer systemctl (works under Steam Game Mode NO_NEW_PRIVS).
-# Fallback: direct wg-quick when already root / via legacy sudo.
+# Control WireGuard for Palworld WITHOUT sudo/polkit.
+# Steam Game Mode (and Desktop Steam launches) set NO_NEW_PRIVS, which blocks
+# sudo. Polkit may also lack an auth agent under Steam. Instead we touch a
+# request file; enabled systemd path units run wg-quick as root.
 set -euo pipefail
 
 CONF_CANDIDATES=(
@@ -11,11 +12,14 @@ CONF_CANDIDATES=(
 )
 
 WG_INTERFACE="wg0"
-WG_QUICK="${WG_QUICK:-/usr/bin/wg-quick}"
-SYSTEMCTL="${SYSTEMCTL:-/usr/bin/systemctl}"
+STATE_DIR="${PALWORLD_WG_STATE:-/home/deck/.local/state/palworld-wg}"
+WANT_UP="${STATE_DIR}/want-up"
+WANT_DOWN="${STATE_DIR}/want-down"
+AGENT_STATUS="${STATE_DIR}/agent-status"
 IP_BIN="${IP_BIN:-/usr/sbin/ip}"
 [[ -x "$IP_BIN" ]] || IP_BIN="/bin/ip"
 [[ -x "$IP_BIN" ]] || IP_BIN="$(command -v ip || true)"
+WAIT_SECONDS="${CTL_WAIT_SECONDS:-20}"
 
 for conf in "${CONF_CANDIDATES[@]}"; do
   [[ -n "$conf" && -f "$conf" ]] || continue
@@ -24,47 +28,90 @@ for conf in "${CONF_CANDIDATES[@]}"; do
   break
 done
 
-UNIT="wg-quick@${WG_INTERFACE}.service"
-
 usage() {
   echo "usage: $0 up|down|status" >&2
   exit 2
 }
 
 [[ $# -eq 1 ]] || usage
+mkdir -p "$STATE_DIR"
 
 iface_up() {
   [[ -n "$IP_BIN" ]] && "$IP_BIN" link show "$WG_INTERFACE" >/dev/null 2>&1
 }
 
+wait_iface() {
+  local want="$1" # up|down
+  local deadline=$((SECONDS + WAIT_SECONDS))
+  while (( SECONDS < deadline )); do
+    if [[ "$want" == up ]] && iface_up; then
+      return 0
+    fi
+    if [[ "$want" == down ]] && ! iface_up; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+request() {
+  local flag="$1"
+  # Retrigger PathExists: remove then create (no systemctl — Steam may hang on polkit).
+  rm -f "$flag"
+  sleep 0.05
+  : >"$flag"
+}
+
 do_up() {
   if iface_up; then
     echo "already up: $WG_INTERFACE"
+    echo up >"$AGENT_STATUS"
     return 0
   fi
 
-  # systemctl talks to PID 1 over D-Bus — not blocked by Steam NO_NEW_PRIVS.
-  if [[ -x "$SYSTEMCTL" ]] && "$SYSTEMCTL" start "$UNIT"; then
+  if [[ ! -f "/etc/wireguard/${WG_INTERFACE}.conf" ]]; then
+    echo "ERROR: missing /etc/wireguard/${WG_INTERFACE}.conf" >&2
+    return 1
+  fi
+
+  rm -f "$WANT_DOWN"
+  request "$WANT_UP"
+
+  if wait_iface up; then
+    echo "started $WG_INTERFACE"
+    echo up >"$AGENT_STATUS"
     return 0
   fi
 
-  # Fallback when invoked as root (sudo path / manual debug).
-  if [[ -x "$WG_QUICK" ]] && [[ "$(id -u)" -eq 0 ]]; then
-    "$WG_QUICK" up "$WG_INTERFACE"
-    return 0
+  echo "ERROR: timed out waiting for $WG_INTERFACE after want-up" >&2
+  echo "HINT: systemctl status palworld-wg-up.path palworld-wg-up.service --no-pager" >&2
+  echo "HINT: journalctl -u palworld-wg-up.service -n 40 --no-pager" >&2
+  if [[ -f "$AGENT_STATUS" ]]; then
+    echo "agent-status=$(cat "$AGENT_STATUS")" >&2
   fi
-
-  echo "ERROR: failed to start $UNIT (is polkit rule installed?)" >&2
   return 1
 }
 
 do_down() {
-  if [[ -x "$SYSTEMCTL" ]]; then
-    "$SYSTEMCTL" stop "$UNIT" >/dev/null 2>&1 || true
+  if ! iface_up; then
+    echo "already down: $WG_INTERFACE"
+    echo down >"$AGENT_STATUS"
+    rm -f "$WANT_UP" "$WANT_DOWN"
+    return 0
   fi
-  if iface_up && [[ "$(id -u)" -eq 0 ]] && [[ -x "$WG_QUICK" ]]; then
-    "$WG_QUICK" down "$WG_INTERFACE" || true
+
+  rm -f "$WANT_UP"
+  request "$WANT_DOWN"
+
+  if wait_iface down; then
+    echo "stopped $WG_INTERFACE"
+    echo down >"$AGENT_STATUS"
+    return 0
   fi
+
+  echo "ERROR: timed out waiting for $WG_INTERFACE to go down" >&2
+  return 1
 }
 
 do_status() {

@@ -1,16 +1,17 @@
-# Palworld + WireGuard on Steam Deck (Game Mode)
+# Palworld + WireGuard on Steam Deck (Game Mode + Desktop Steam)
 
-WireGuard stays **off** until you press Play on Palworld. The launch script starts `wg-quick@wg0` via **systemctl + polkit**, runs the game, then stops the tunnel.
+WireGuard stays **off** until you press Play on Palworld. The launch script creates a request file; a **systemd path unit** (running as root) brings `wg0` up, then tears it down when the game exits.
 
-**Why not sudo?** Steam Game Mode sets `NO_NEW_PRIVS` on launched processes. That blocks `sudo` / setuid even with NOPASSWD. Desktop Konsole tests can pass while Game Mode still fails — that is expected. Polkit + systemctl talks to systemd over D-Bus and works under Game Mode.
+**Why this design?** Steam sets `NO_NEW_PRIVS` when you press Play (Desktop Steam and Game Mode). That blocks `sudo`. Desktop Konsole also has a polkit password agent that Steam does not, so “works in Konsole / fails on Play” is expected for sudo/polkit approaches.
 
 If WireGuard fails, **Palworld still launches**. Check:
 
-- `~/.local/state/palworld-wg/launch.log`
-- `~/.local/state/palworld-wg/last-status`
+- `~/.local/state/palworld-wg/launch.log` — full session log
+- `~/.local/state/palworld-wg/last-status` — `up` / `down (...)`
+- `~/.local/state/palworld-wg/last-failure.log` — detailed dump on failure
 
 ```
-Play → systemctl start wg-quick@wg0 → wait for 10.8.0.1 → game → systemctl stop
+Play → touch want-up → systemd runs wg-quick up → game → touch want-down → wg-quick down
 ```
 
 ## Files
@@ -19,29 +20,17 @@ Play → systemctl start wg-quick@wg0 → wait for 10.8.0.1 → game → systemc
 |------|---------|
 | `install.sh` | One-shot Konsole installer (run this) |
 | `palworld-wg.sh` | Steam Launch Options wrapper |
-| `palworld-wg-ctl` | Starts/stops/status via `systemctl` |
+| `palworld-wg-ctl` | Creates want-up / want-down request files |
 | `palworld-wg.conf` | Interface + host IP |
-| `99-palworld-wg.rules` | Polkit: allow `deck` to start/stop `wg-quick@wg0` |
-| `sudoers.palworld-wg` | Optional Desktop-only sudo fallback (not used by Game Mode path) |
+| `systemd/*` | Path/service units + root helper scripts |
 
 ---
 
 ## Prerequisites
 
 - `/etc/wireguard/wg0.conf` installed
-- `wireguard-tools` (`wg-quick`, `wg-quick@.service`)
+- `wireguard-tools` (`/usr/bin/wg-quick`)
 - Palworld installed
-
-Manual tunnel test (Desktop):
-
-```bash
-sudo systemctl start wg-quick@wg0
-sudo wg show
-ping -c 2 10.8.0.1
-sudo systemctl stop wg-quick@wg0
-```
-
-Do **not** `systemctl enable wg-quick@wg0` (that would auto-start at boot).
 
 ---
 
@@ -54,7 +43,7 @@ cd ~/Palworld-Script-main   # or wherever this folder is
 bash install.sh
 ```
 
-Enter the Deck password when asked. The script **creates any missing dirs** and **overwrites** previous helper files, then tests tunnel up/down **without** sudo.
+Enter the Deck password when asked. The script **creates any missing dirs**, **overwrites** previous helper files, enables systemd path watchers, and tests tunnel up/down **without** sudo.
 
 When it prints `Install OK`, set Launch Options once:
 
@@ -62,21 +51,16 @@ When it prints `Install OK`, set Launch Options once:
 /home/deck/bin/palworld-wg.sh %command%
 ```
 
-Then Game Mode → Play Palworld.
-
-If `install.sh` says polkit failed, reboot once and run:
-
-```bash
-/home/deck/bin/palworld-wg-ctl up
-```
+Then press Play (Desktop Steam or Game Mode).
 
 After playing, check:
 
 ```bash
 cat /home/deck/.local/state/palworld-wg/last-status
-tail -30 /home/deck/.local/state/palworld-wg/launch.log
+tail -50 /home/deck/.local/state/palworld-wg/launch.log
+# If it failed:
+cat /home/deck/.local/state/palworld-wg/last-failure.log
 ```
-
 
 ---
 
@@ -84,11 +68,10 @@ tail -30 /home/deck/.local/state/palworld-wg/launch.log
 
 | Symptom | Fix |
 |---------|-----|
-| Desktop `sudo wg-quick` works, Game Mode does not | Normal if using sudo only. Install **polkit** rule and use **ctl without sudo**. |
-| `NoNewPrivs=1` in log + bring-up failed | Polkit missing/wrong. Reinstall `99-palworld-wg.rules`, then `ctl up` with no sudo. |
-| `last-status` is `up` but Relay shows offline | Handshake/traffic issue: `ping 10.8.0.1`, confirm peer still on server, endpoint reachable. |
-| Auth popup on `ctl up` | Polkit rule not applied; fix Step 2 (reboot if needed). |
-| Game opens, cannot join server | WG failed open; read launch.log. |
+| Konsole/`ctl up` works, Play does not | Old sudo/polkit install. Re-run `bash install.sh` (path-unit version). Confirm Launch Options. |
+| `last-status` down after Play | Paste `last-failure.log`. Check `systemctl status palworld-wg-up.path --no-pager`. |
+| `last-status` is `up` but Relay shows offline | Handshake/traffic: join via `10.8.0.1`, `ping 10.8.0.1` while in-game/tunnel up. |
+| Path unit inactive | `sudo systemctl enable --now palworld-wg-up.path palworld-wg-down.path` |
 
 ---
 
@@ -98,8 +81,14 @@ tail -30 /home/deck/.local/state/palworld-wg/launch.log
 # Clear Launch Options in Steam
 
 sudo steamos-readonly disable
-sudo rm -f /etc/polkit-1/rules.d/99-palworld-wg.rules
-sudo rm -f /etc/sudoers.d/palworld-wg
+sudo systemctl disable --now palworld-wg-up.path palworld-wg-down.path
+sudo rm -f /etc/systemd/system/palworld-wg-up.path \
+  /etc/systemd/system/palworld-wg-up.service \
+  /etc/systemd/system/palworld-wg-down.path \
+  /etc/systemd/system/palworld-wg-down.service
+sudo systemctl daemon-reload
+sudo rm -rf /home/deck/.local/lib/palworld-wg
+sudo rm -f /etc/polkit-1/rules.d/99-palworld-wg.rules /etc/sudoers.d/palworld-wg
 sudo steamos-readonly enable
 
 rm -f /home/deck/bin/palworld-wg.sh /home/deck/bin/palworld-wg-ctl
@@ -110,4 +99,4 @@ rm -f /home/deck/.config/palworld-wg.conf
 
 ## Security note
 
-Polkit only allows `deck` to start/stop **`wg-quick@wg0.service`**. Do not paste `wg0.conf` (private key) into chat.
+The path units only run the two small root scripts that call `wg-quick up/down wg0`. Do not paste `wg0.conf` (private key) into chat.

@@ -1,0 +1,6 @@
+[Unit]
+Description=Tear down WireGuard wg0 after Palworld
+
+[Service]
+Type=oneshot
+ExecStart=/home/deck/.local/lib/palworld-wg/palworld-wg-down.sh

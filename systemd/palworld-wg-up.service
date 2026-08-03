@@ -1,0 +1,8 @@
+[Unit]
+Description=Bring up WireGuard wg0 for Palworld
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/deck/.local/lib/palworld-wg/palworld-wg-up.sh

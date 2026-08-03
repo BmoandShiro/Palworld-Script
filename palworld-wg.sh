@@ -8,6 +8,7 @@
 # Steam Game Mode blocks via PR_SET_NO_NEW_PRIVS.
 #
 # If WireGuard fails, Palworld still launches.
+# Diagnostics: ~/.local/state/palworld-wg/launch.log and last-failure.log
 set -euo pipefail
 
 CONF_CANDIDATES=(
@@ -25,22 +26,36 @@ IP_BIN="${IP_BIN:-/usr/sbin/ip}"
 [[ -x "$IP_BIN" ]] || IP_BIN="/bin/ip"
 [[ -x "$IP_BIN" ]] || IP_BIN="$(command -v ip || true)"
 WG_BIN="${WG_BIN:-/usr/bin/wg}"
+PING_BIN="$(command -v ping || true)"
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/palworld-wg"
 LOG="$LOG_DIR/launch.log"
+FAIL_LOG="$LOG_DIR/last-failure.log"
 STATUS_FILE="$LOG_DIR/last-status"
+SESSION_ID="$(date +%Y%m%d-%H%M%S)-$$"
+
+LOADED_CONF=""
 
 for conf in "${CONF_CANDIDATES[@]}"; do
   [[ -n "$conf" && -f "$conf" ]] || continue
   # shellcheck disable=SC1090
   source "$conf"
+  LOADED_CONF="$conf"
   break
 done
 
 UNIT="wg-quick@${WG_INTERFACE}.service"
 mkdir -p "$LOG_DIR"
 
+# Keep launch.log from growing forever (~last 400KB kept on each start).
+if [[ -f "$LOG" ]]; then
+  local_size="$(wc -c <"$LOG" 2>/dev/null || echo 0)"
+  if [[ "${local_size:-0}" -gt 400000 ]]; then
+    tail -c 200000 "$LOG" >"${LOG}.tmp" 2>/dev/null && mv -f "${LOG}.tmp" "$LOG"
+  fi
+fi
+
 log() {
-  printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG" >&2
+  printf '[%s] [%s] %s\n' "$(date -Iseconds)" "$SESSION_ID" "$*" | tee -a "$LOG" >&2
 }
 
 write_status() {
@@ -55,6 +70,70 @@ nonewprivs() {
   local v
   v="$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status 2>/dev/null || echo unknown)"
   printf '%s' "$v"
+}
+
+dump_diagnostics() {
+  local reason="$1"
+  {
+    echo "==== palworld-wg failure dump ===="
+    echo "time=$(date -Iseconds)"
+    echo "session=$SESSION_ID"
+    echo "reason=$reason"
+    echo "user=$(id -un) uid=$(id -u) home=${HOME:-}"
+    echo "pwd=$(pwd 2>/dev/null || true)"
+    echo "NoNewPrivs=$(nonewprivs)"
+    echo "loaded_conf=${LOADED_CONF:-none}"
+    echo "WG_INTERFACE=$WG_INTERFACE WG_HOST=$WG_HOST UNIT=$UNIT"
+    echo "CTL=$CTL (exists=$([[ -e $CTL ]] && echo yes || echo no) exec=$([[ -x $CTL ]] && echo yes || echo no))"
+    echo "SYSTEMCTL=$SYSTEMCTL (exec=$([[ -x $SYSTEMCTL ]] && echo yes || echo no))"
+    echo "IP_BIN=$IP_BIN WG_BIN=$WG_BIN PING_BIN=${PING_BIN:-none}"
+    echo "wg_conf=$([[ -f /etc/wireguard/${WG_INTERFACE}.conf ]] && echo present || echo MISSING)"
+    echo "want-up=$([[ -f $LOG_DIR/want-up ]] && echo present || echo absent) want-down=$([[ -f $LOG_DIR/want-down ]] && echo present || echo absent)"
+    echo "agent-status=$(cat "$LOG_DIR/agent-status" 2>/dev/null || echo none)"
+    echo "path_up=$(systemctl is-enabled palworld-wg-up.path 2>&1 || true) $(systemctl is-active palworld-wg-up.path 2>&1 || true)"
+    echo "path_down=$(systemctl is-enabled palworld-wg-down.path 2>&1 || true) $(systemctl is-active palworld-wg-down.path 2>&1 || true)"
+    echo "iface_up=$(iface_up && echo yes || echo no)"
+    echo "--- env (selected) ---"
+    echo "PATH=${PATH:-}"
+    echo "DISPLAY=${DISPLAY:-} XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-} STEAM_RUNTIME=${STEAM_RUNTIME:-}"
+    echo "DBUS_SYSTEM_BUS_ADDRESS=${DBUS_SYSTEM_BUS_ADDRESS:-} DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-}"
+    echo "--- ip link ---"
+    "$IP_BIN" link show "$WG_INTERFACE" 2>&1 || echo "(no $WG_INTERFACE)"
+    echo "--- systemctl status path/up ---"
+    "$SYSTEMCTL" status palworld-wg-up.path palworld-wg-up.service --no-pager -l 2>&1 | tail -60 || true
+    echo "--- journalctl palworld-wg-up (last 40) ---"
+    journalctl -u palworld-wg-up.service -n 40 --no-pager 2>&1 | tail -50 || true
+    if [[ -x "$WG_BIN" ]]; then
+      echo "--- wg show ---"
+      "$WG_BIN" show 2>&1 || true
+    fi
+    echo "--- recent launch.log tail ---"
+    tail -40 "$LOG" 2>/dev/null || true
+    echo "==== end dump ===="
+  } >"$FAIL_LOG" 2>&1
+
+  log "Failure diagnostics written to $FAIL_LOG"
+  log "diag: NoNewPrivs=$(nonewprivs) path_up=$(systemctl is-active palworld-wg-up.path 2>/dev/null || echo ?) wg_conf=$([[ -f /etc/wireguard/${WG_INTERFACE}.conf ]] && echo present || echo MISSING) iface=$(iface_up && echo up || echo down) agent=$(cat "$LOG_DIR/agent-status" 2>/dev/null || echo none)"
+  if [[ -f "$FAIL_LOG" ]]; then
+    while IFS= read -r line; do
+      case "$line" in
+        ERROR:*|systemctl\ start\ output:*|Hint:*|Unit\ *|agent-status=*)
+          log "diag: $line"
+          ;;
+      esac
+    done < <(grep -E 'ERROR:|Failed|Access denied|Authentication|MISSING|agent-status|wg-quick' "$FAIL_LOG" 2>/dev/null | tail -25)
+  fi
+}
+
+log_session_banner() {
+  log "======== session start ========"
+  log "wrapper=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  log "user=$(id -un) uid=$(id -u) NoNewPrivs=$(nonewprivs)"
+  log "conf=${LOADED_CONF:-none} interface=$WG_INTERFACE host=$WG_HOST"
+  log "ctl=$CTL"
+  log "path_units=$(systemctl is-enabled palworld-wg-up.path 2>/dev/null || echo unknown)/$(systemctl is-active palworld-wg-up.path 2>/dev/null || echo unknown)"
+  log "wg_conf=$([[ -f /etc/wireguard/${WG_INTERFACE}.conf ]] && echo present || echo MISSING)"
+  log "args: $*"
 }
 
 run_ctl() {
@@ -74,7 +153,10 @@ run_ctl() {
   set -e
 
   if [[ -n "$out" ]]; then
-    log "ctl $action output: $out"
+    # Log multi-line ctl output line-by-line for readability
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && log "ctl $action: $line"
+    done <<<"$out"
   fi
   if [[ $rc -ne 0 ]]; then
     log "ctl $action exit=$rc"
@@ -83,15 +165,13 @@ run_ctl() {
 }
 
 wg_up() {
-  log "NoNewPrivs=$(nonewprivs) (1 means Steam blocked sudo; systemctl path required)"
-
   if iface_up; then
     log "WireGuard already active: $WG_INTERFACE"
     write_status "up (already active)"
     return 0
   fi
 
-  log "Bringing up WireGuard via systemctl: $UNIT"
+  log "Bringing up WireGuard via request file (systemd path): $WG_INTERFACE"
 
   if run_ctl up && iface_up; then
     if [[ -x "$WG_BIN" ]]; then
@@ -101,43 +181,33 @@ wg_up() {
     return 0
   fi
 
-  # Last-resort Desktop fallback (will fail under Game Mode NO_NEW_PRIVS).
-  if [[ "$(nonewprivs)" != "1" ]] && [[ -x /usr/bin/sudo ]]; then
-    log "Trying sudo fallback (Desktop only)..."
-    set +e
-    out="$(/usr/bin/sudo -n /usr/bin/wg-quick up "$WG_INTERFACE" 2>&1)"
-    rc=$?
-    set -e
-    [[ -n "$out" ]] && log "sudo wg-quick output: $out"
-    if [[ $rc -eq 0 ]] && iface_up; then
-      write_status "up (sudo fallback)"
-      return 0
-    fi
-  fi
-
   write_status "down (bring-up failed)"
   log "WARN: failed to bring up '$WG_INTERFACE'."
-  log "Install polkit rule 99-palworld-wg.rules and ensure systemctl start $UNIT works as deck."
+  dump_diagnostics "bring-up failed"
   return 1
 }
 
 wg_down() {
   log "Bringing down WireGuard: $WG_INTERFACE"
   run_ctl down || true
-  if ! iface_up; then
+  if iface_up; then
+    log "WARN: $WG_INTERFACE still present after down"
+    write_status "up (down failed)"
+  else
     write_status "down"
   fi
 }
 
 host_reachable() {
-  if command -v ping >/dev/null 2>&1; then
-    ping -c 1 -W 1 "$WG_HOST" >/dev/null 2>&1 && return 0
+  if [[ -n "$PING_BIN" ]]; then
+    "$PING_BIN" -c 1 -W 1 "$WG_HOST" >/dev/null 2>&1 && return 0
   fi
   return 1
 }
 
 wait_for_host() {
   local deadline=$((SECONDS + WAIT_SECONDS))
+  local saw_iface=0
   log "Waiting up to ${WAIT_SECONDS}s for $WG_HOST (or active tunnel)..."
   while (( SECONDS < deadline )); do
     if host_reachable; then
@@ -145,6 +215,7 @@ wait_for_host() {
       return 0
     fi
     if iface_up; then
+      saw_iface=1
       sleep 2
       if iface_up; then
         log "Tunnel active (ping to $WG_HOST failed or filtered; continuing)"
@@ -153,7 +224,8 @@ wait_for_host() {
     fi
     sleep 1
   done
-  log "WARN: timed out waiting for WireGuard / $WG_HOST"
+  log "WARN: timed out waiting for WireGuard / $WG_HOST (iface_seen=$saw_iface)"
+  dump_diagnostics "host wait timed out"
   return 1
 }
 
@@ -161,14 +233,17 @@ cleanup() {
   local status=$?
   wg_down || true
   log "Cleanup done (game exit status before trap: $status)"
+  log "======== session end ========"
 }
 
 if [[ $# -lt 1 ]]; then
+  mkdir -p "$LOG_DIR"
   log "ERROR: no game command provided. Use Steam Launch Options:"
   log "  /home/deck/bin/palworld-wg.sh %command%"
   exit 2
 fi
 
+log_session_banner "$@"
 trap cleanup EXIT INT TERM HUP
 
 if wg_up; then

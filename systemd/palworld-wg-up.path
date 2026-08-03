@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for Palworld WireGuard UP request
+After=network-online.target
+
+[Path]
+PathExists=/home/deck/.local/state/palworld-wg/want-up
+Unit=palworld-wg-up.service
+
+[Install]
+WantedBy=multi-user.target
