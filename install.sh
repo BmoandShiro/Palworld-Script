@@ -50,6 +50,16 @@ echo "==> Overwriting user scripts in ${BIN_DIR}"
 install -m 755 -T "${SCRIPT_DIR}/palworld-wg.sh" "${BIN_DIR}/palworld-wg.sh"
 install -m 755 -T "${SCRIPT_DIR}/palworld-wg-ctl" "${BIN_DIR}/palworld-wg-ctl"
 
+# Hard-fail if an old ctl (with broken conf visibility check) somehow remains
+if grep -q 'missing /etc/wireguard' "${BIN_DIR}/palworld-wg-ctl"; then
+  echo "ERROR: installed ctl still contains old 'missing /etc/wireguard' check."
+  echo "Update the Palworld-Script folder from the latest copy and re-run."
+  exit 1
+fi
+
+CTL_VER="$("${BIN_DIR}/palworld-wg-ctl" version 2>/dev/null || echo unknown)"
+echo "==> ctl version: ${CTL_VER} (expect 2026-08-02c or newer)"
+
 echo "==> Overwriting ${CONF_DST}"
 install -m 644 -T "${SCRIPT_DIR}/palworld-wg.conf" "$CONF_DST"
 
@@ -120,7 +130,7 @@ sudo mkdir -p "$LIB_DIR" "$UNIT_DIR" /etc/wireguard
 if [[ -n "$PEER_SRC" ]]; then
   echo "==> Installing /etc/wireguard/wg0.conf (overwrite)"
   sudo install -m 600 -o root -g root -T "$PEER_SRC" /etc/wireguard/wg0.conf
-elif [[ -f /etc/wireguard/wg0.conf ]]; then
+elif sudo test -f /etc/wireguard/wg0.conf; then
   echo "==> Keeping existing /etc/wireguard/wg0.conf"
 else
   echo
@@ -156,18 +166,25 @@ rm -f "${STATE_DIR}/want-up" "${STATE_DIR}/want-down"
 
 sudo steamos-readonly enable || true
 
-if [[ ! -f /etc/wireguard/wg0.conf ]]; then
+# /etc/wireguard is often mode 700 — deck cannot see files with a normal test -f
+if ! sudo test -f /etc/wireguard/wg0.conf; then
   echo
-  echo "Install partial: helpers/units OK, but tunnel test skipped (no wg0.conf)."
-  echo "After placing the peer conf, run:"
-  echo "  sudo steamos-readonly disable"
-  echo "  sudo mkdir -p /etc/wireguard"
-  echo "  sudo cp ~/Downloads/wg0.conf /etc/wireguard/wg0.conf"
-  echo "  sudo chmod 600 /etc/wireguard/wg0.conf"
-  echo "  sudo steamos-readonly enable"
+  echo "Install partial: helpers/units OK, but /etc/wireguard/wg0.conf missing."
+  if [[ -n "$PEER_SRC" ]]; then
+    echo "Retry copy from: $PEER_SRC"
+    echo "  sudo steamos-readonly disable"
+    echo "  sudo mkdir -p /etc/wireguard"
+    echo "  sudo install -m 600 -o root -g root -T \"$PEER_SRC\" /etc/wireguard/wg0.conf"
+    echo "  sudo steamos-readonly enable"
+  else
+    echo "Place your peer .conf then re-run install, or:"
+    echo "  WG_PEER_CONF=/path/to/peer.conf bash install.sh"
+  fi
   echo "  /home/deck/bin/palworld-wg-ctl up"
   exit 1
 fi
+
+echo "==> Verified /etc/wireguard/wg0.conf (via sudo)"
 
 echo "==> Testing tunnel bring-up WITHOUT sudo (Steam Play path)"
 "${BIN_DIR}/palworld-wg-ctl" down >/dev/null 2>&1 || true

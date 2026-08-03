@@ -2,6 +2,15 @@
 # Runs as root via systemd. Always clears the want-up flag.
 set -u
 STATE=/home/deck/.local/state/palworld-wg
+CONF=/etc/wireguard/wg0.conf
+
+if [[ ! -f "$CONF" ]]; then
+  echo "up-failed-missing-conf" >"${STATE}/agent-status"
+  rm -f "${STATE}/want-up"
+  echo "ERROR: missing $CONF" >&2
+  exit 1
+fi
+
 /usr/bin/wg-quick up wg0 || true
 rm -f "${STATE}/want-up"
 # Mark result for the unprivileged waiter

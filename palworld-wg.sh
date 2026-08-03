@@ -4,12 +4,14 @@
 # Launch Options (exact):
 #   /home/deck/bin/palworld-wg.sh %command%
 #
-# Uses systemctl to start/stop wg-quick@wg0 (polkit). This avoids sudo, which
-# Steam Game Mode blocks via PR_SET_NO_NEW_PRIVS.
+# Uses a systemd path unit (touch want-up) so Steam Play works without sudo.
 #
 # If WireGuard fails, Palworld still launches.
 # Diagnostics: ~/.local/state/palworld-wg/launch.log and last-failure.log
 set -euo pipefail
+
+# Steam injects 32-bit gameoverlayrenderer via LD_PRELOAD; strip it for host tools.
+unset LD_PRELOAD LD_LIBRARY_PATH STEAM_RUNTIME_LIBRARY_PATH || true
 
 CONF_CANDIDATES=(
   "${PALWORLD_WG_CONF:-}"
@@ -62,8 +64,15 @@ write_status() {
   printf '%s\n' "$*" >"$STATUS_FILE"
 }
 
+# Run host binaries without Steam's LD_PRELOAD / weird PATH.
+clean_run() {
+  env -u LD_PRELOAD -u LD_LIBRARY_PATH -u STEAM_RUNTIME_LIBRARY_PATH \
+    PATH="/usr/sbin:/usr/bin:/sbin:/bin" \
+    "$@"
+}
+
 iface_up() {
-  [[ -n "$IP_BIN" ]] && "$IP_BIN" link show "$WG_INTERFACE" >/dev/null 2>&1
+  [[ -n "$IP_BIN" ]] && clean_run "$IP_BIN" link show "$WG_INTERFACE" >/dev/null 2>&1
 }
 
 nonewprivs() {
@@ -85,27 +94,34 @@ dump_diagnostics() {
     echo "loaded_conf=${LOADED_CONF:-none}"
     echo "WG_INTERFACE=$WG_INTERFACE WG_HOST=$WG_HOST UNIT=$UNIT"
     echo "CTL=$CTL (exists=$([[ -e $CTL ]] && echo yes || echo no) exec=$([[ -x $CTL ]] && echo yes || echo no))"
+    echo "ctl_version=$(clean_run "$CTL" version 2>/dev/null || echo unknown)"
     echo "SYSTEMCTL=$SYSTEMCTL (exec=$([[ -x $SYSTEMCTL ]] && echo yes || echo no))"
     echo "IP_BIN=$IP_BIN WG_BIN=$WG_BIN PING_BIN=${PING_BIN:-none}"
-    echo "wg_conf=$([[ -f /etc/wireguard/${WG_INTERFACE}.conf ]] && echo present || echo MISSING)"
+    # /etc/wireguard is often mode 700 — deck cannot -f the conf; do not call it MISSING.
+    if [[ -d /etc/wireguard ]]; then
+      echo "wg_conf_dir=/etc/wireguard (present; file visibility may require root)"
+    else
+      echo "wg_conf_dir=MISSING"
+    fi
     echo "want-up=$([[ -f $LOG_DIR/want-up ]] && echo present || echo absent) want-down=$([[ -f $LOG_DIR/want-down ]] && echo present || echo absent)"
     echo "agent-status=$(cat "$LOG_DIR/agent-status" 2>/dev/null || echo none)"
-    echo "path_up=$(systemctl is-enabled palworld-wg-up.path 2>&1 || true) $(systemctl is-active palworld-wg-up.path 2>&1 || true)"
-    echo "path_down=$(systemctl is-enabled palworld-wg-down.path 2>&1 || true) $(systemctl is-active palworld-wg-down.path 2>&1 || true)"
+    echo "path_up=$(clean_run "$SYSTEMCTL" is-enabled palworld-wg-up.path 2>&1 || true) $(clean_run "$SYSTEMCTL" is-active palworld-wg-up.path 2>&1 || true)"
+    echo "path_down=$(clean_run "$SYSTEMCTL" is-enabled palworld-wg-down.path 2>&1 || true) $(clean_run "$SYSTEMCTL" is-active palworld-wg-down.path 2>&1 || true)"
     echo "iface_up=$(iface_up && echo yes || echo no)"
     echo "--- env (selected) ---"
     echo "PATH=${PATH:-}"
+    echo "LD_PRELOAD=${LD_PRELOAD:-<unset>}"
     echo "DISPLAY=${DISPLAY:-} XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-} STEAM_RUNTIME=${STEAM_RUNTIME:-}"
     echo "DBUS_SYSTEM_BUS_ADDRESS=${DBUS_SYSTEM_BUS_ADDRESS:-} DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-}"
     echo "--- ip link ---"
-    "$IP_BIN" link show "$WG_INTERFACE" 2>&1 || echo "(no $WG_INTERFACE)"
+    clean_run "$IP_BIN" link show "$WG_INTERFACE" 2>&1 || echo "(no $WG_INTERFACE)"
     echo "--- systemctl status path/up ---"
-    "$SYSTEMCTL" status palworld-wg-up.path palworld-wg-up.service --no-pager -l 2>&1 | tail -60 || true
+    clean_run "$SYSTEMCTL" status palworld-wg-up.path palworld-wg-up.service --no-pager -l 2>&1 | tail -60 || true
     echo "--- journalctl palworld-wg-up (last 40) ---"
-    journalctl -u palworld-wg-up.service -n 40 --no-pager 2>&1 | tail -50 || true
+    clean_run journalctl -u palworld-wg-up.service -n 40 --no-pager 2>&1 | tail -50 || true
     if [[ -x "$WG_BIN" ]]; then
       echo "--- wg show ---"
-      "$WG_BIN" show 2>&1 || true
+      clean_run "$WG_BIN" show 2>&1 || true
     fi
     echo "--- recent launch.log tail ---"
     tail -40 "$LOG" 2>/dev/null || true
@@ -113,15 +129,15 @@ dump_diagnostics() {
   } >"$FAIL_LOG" 2>&1
 
   log "Failure diagnostics written to $FAIL_LOG"
-  log "diag: NoNewPrivs=$(nonewprivs) path_up=$(systemctl is-active palworld-wg-up.path 2>/dev/null || echo ?) wg_conf=$([[ -f /etc/wireguard/${WG_INTERFACE}.conf ]] && echo present || echo MISSING) iface=$(iface_up && echo up || echo down) agent=$(cat "$LOG_DIR/agent-status" 2>/dev/null || echo none)"
+  log "diag: NoNewPrivs=$(nonewprivs) ctl_version=$(clean_run "$CTL" version 2>/dev/null || echo ?) path_up=$(clean_run "$SYSTEMCTL" is-active palworld-wg-up.path 2>/dev/null || echo ?) iface=$(iface_up && echo up || echo down) agent=$(cat "$LOG_DIR/agent-status" 2>/dev/null || echo none)"
   if [[ -f "$FAIL_LOG" ]]; then
     while IFS= read -r line; do
       case "$line" in
-        ERROR:*|systemctl\ start\ output:*|Hint:*|Unit\ *|agent-status=*)
+        ERROR:*|Hint:*|Unit\ *|agent-status=*|ctl-version=*|requesting-*)
           log "diag: $line"
           ;;
       esac
-    done < <(grep -E 'ERROR:|Failed|Access denied|Authentication|MISSING|agent-status|wg-quick' "$FAIL_LOG" 2>/dev/null | tail -25)
+    done < <(grep -E 'ERROR:|Failed|Access denied|Authentication|MISSING|agent-status|wg-quick|ctl-version|requesting-|timed out|want-up' "$FAIL_LOG" 2>/dev/null | grep -v 'ld.so: object' | tail -25)
   fi
 }
 
@@ -130,9 +146,8 @@ log_session_banner() {
   log "wrapper=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
   log "user=$(id -un) uid=$(id -u) NoNewPrivs=$(nonewprivs)"
   log "conf=${LOADED_CONF:-none} interface=$WG_INTERFACE host=$WG_HOST"
-  log "ctl=$CTL"
-  log "path_units=$(systemctl is-enabled palworld-wg-up.path 2>/dev/null || echo unknown)/$(systemctl is-active palworld-wg-up.path 2>/dev/null || echo unknown)"
-  log "wg_conf=$([[ -f /etc/wireguard/${WG_INTERFACE}.conf ]] && echo present || echo MISSING)"
+  log "ctl=$CTL version=$(clean_run "$CTL" version 2>/dev/null || echo unknown)"
+  log "path_units=$(clean_run "$SYSTEMCTL" is-enabled palworld-wg-up.path 2>/dev/null || echo unknown)/$(clean_run "$SYSTEMCTL" is-active palworld-wg-up.path 2>/dev/null || echo unknown)"
   log "args: $*"
 }
 
@@ -147,15 +162,23 @@ run_ctl() {
   fi
 
   set +e
-  # No sudo — ctl uses systemctl/polkit so Game Mode NO_NEW_PRIVS is OK.
-  out="$("$CTL" "$action" 2>&1)"
+  # Clean env so Steam LD_PRELOAD cannot break host bash/ip/systemctl.
+  out="$(
+    env -u LD_PRELOAD -u LD_LIBRARY_PATH -u STEAM_RUNTIME_LIBRARY_PATH \
+      PATH="/usr/sbin:/usr/bin:/sbin:/bin" \
+      HOME="/home/deck" USER="deck" LOGNAME="deck" \
+      "$CTL" "$action" 2>&1
+  )"
   rc=$?
   set -e
 
   if [[ -n "$out" ]]; then
-    # Log multi-line ctl output line-by-line for readability
     while IFS= read -r line; do
-      [[ -n "$line" ]] && log "ctl $action: $line"
+      [[ -n "$line" ]] || continue
+      # Drop noisy Steam overlay preload warnings
+      [[ "$line" == *ld.so:object* ]] && continue
+      [[ "$line" == *gameoverlayrenderer.so* ]] && continue
+      log "ctl $action: $line"
     done <<<"$out"
   fi
   if [[ $rc -ne 0 ]]; then

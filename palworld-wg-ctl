@@ -3,6 +3,9 @@
 # Steam Game Mode (and Desktop Steam launches) set NO_NEW_PRIVS, which blocks
 # sudo. Polkit may also lack an auth agent under Steam. Instead we touch a
 # request file; enabled systemd path units run wg-quick as root.
+#
+# CTL_VERSION is logged by the launch wrapper — bump when changing behavior.
+CTL_VERSION="2026-08-02c"
 set -euo pipefail
 
 CONF_CANDIDATES=(
@@ -29,11 +32,21 @@ for conf in "${CONF_CANDIDATES[@]}"; do
 done
 
 usage() {
-  echo "usage: $0 up|down|status" >&2
+  echo "usage: $0 up|down|status|version" >&2
   exit 2
 }
 
 [[ $# -eq 1 ]] || usage
+
+if [[ "$1" == "version" ]]; then
+  echo "$CTL_VERSION"
+  exit 0
+fi
+
+# Steam injects a 32-bit overlay via LD_PRELOAD; strip it for host tools.
+unset LD_PRELOAD LD_LIBRARY_PATH STEAM_RUNTIME_LIBRARY_PATH || true
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
 mkdir -p "$STATE_DIR"
 
 iface_up() {
@@ -50,6 +63,10 @@ wait_iface() {
     if [[ "$want" == down ]] && ! iface_up; then
       return 0
     fi
+    # Surface agent progress while waiting
+    if [[ -f "$AGENT_STATUS" ]]; then
+      :
+    fi
     sleep 0.25
   done
   return 1
@@ -59,23 +76,27 @@ request() {
   local flag="$1"
   # Retrigger PathExists: remove then create (no systemctl — Steam may hang on polkit).
   rm -f "$flag"
-  sleep 0.05
-  : >"$flag"
+  sync || true
+  sleep 0.1
+  # Create via rename so the path unit reliably sees a create event
+  : >"${flag}.tmp"
+  mv -f "${flag}.tmp" "$flag"
+  sync || true
 }
 
 do_up() {
+  echo "ctl-version=$CTL_VERSION"
+
   if iface_up; then
     echo "already up: $WG_INTERFACE"
     echo up >"$AGENT_STATUS"
     return 0
   fi
 
-  if [[ ! -f "/etc/wireguard/${WG_INTERFACE}.conf" ]]; then
-    echo "ERROR: missing /etc/wireguard/${WG_INTERFACE}.conf" >&2
-    return 1
-  fi
-
+  # Never test -f /etc/wireguard/... as user deck: dir is often mode 700.
+  echo "requesting-up via $WANT_UP"
   rm -f "$WANT_DOWN"
+  echo "pending-up" >"$AGENT_STATUS"
   request "$WANT_UP"
 
   if wait_iface up; then
@@ -90,10 +111,15 @@ do_up() {
   if [[ -f "$AGENT_STATUS" ]]; then
     echo "agent-status=$(cat "$AGENT_STATUS")" >&2
   fi
+  if [[ -f "$WANT_UP" ]]; then
+    echo "HINT: want-up still present — path unit may not have fired" >&2
+  fi
   return 1
 }
 
 do_down() {
+  echo "ctl-version=$CTL_VERSION"
+
   if ! iface_up; then
     echo "already down: $WG_INTERFACE"
     echo down >"$AGENT_STATUS"
@@ -101,7 +127,9 @@ do_down() {
     return 0
   fi
 
+  echo "requesting-down via $WANT_DOWN"
   rm -f "$WANT_UP"
+  echo "pending-down" >"$AGENT_STATUS"
   request "$WANT_DOWN"
 
   if wait_iface down; then
