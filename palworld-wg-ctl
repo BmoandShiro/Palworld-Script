@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Privileged helper: bring WireGuard up/down via wg-quick.
-# Installed on the Deck as /home/deck/bin/palworld-wg-ctl (root-owned).
-# Invoked via passwordless sudo from palworld-wg.sh (including Game Mode).
-#
-# Expects /etc/wireguard/<WG_INTERFACE>.conf (default: wg0).
+# Privileged helper for WireGuard on Steam Deck.
+# Prefer systemctl (works under Steam Game Mode NO_NEW_PRIVS).
+# Fallback: direct wg-quick when already root / via legacy sudo.
 set -euo pipefail
 
 CONF_CANDIDATES=(
@@ -14,6 +12,7 @@ CONF_CANDIDATES=(
 
 WG_INTERFACE="wg0"
 WG_QUICK="${WG_QUICK:-/usr/bin/wg-quick}"
+SYSTEMCTL="${SYSTEMCTL:-/usr/bin/systemctl}"
 IP_BIN="${IP_BIN:-/usr/sbin/ip}"
 [[ -x "$IP_BIN" ]] || IP_BIN="/bin/ip"
 [[ -x "$IP_BIN" ]] || IP_BIN="$(command -v ip || true)"
@@ -25,6 +24,8 @@ for conf in "${CONF_CANDIDATES[@]}"; do
   break
 done
 
+UNIT="wg-quick@${WG_INTERFACE}.service"
+
 usage() {
   echo "usage: $0 up|down|status" >&2
   exit 2
@@ -32,37 +33,52 @@ usage() {
 
 [[ $# -eq 1 ]] || usage
 
-if [[ ! -x "$WG_QUICK" ]]; then
-  echo "ERROR: wg-quick not found at $WG_QUICK" >&2
-  exit 127
-fi
-
 iface_up() {
-  "$IP_BIN" link show "$WG_INTERFACE" >/dev/null 2>&1
+  [[ -n "$IP_BIN" ]] && "$IP_BIN" link show "$WG_INTERFACE" >/dev/null 2>&1
+}
+
+do_up() {
+  if iface_up; then
+    echo "already up: $WG_INTERFACE"
+    return 0
+  fi
+
+  # systemctl talks to PID 1 over D-Bus — not blocked by Steam NO_NEW_PRIVS.
+  if [[ -x "$SYSTEMCTL" ]] && "$SYSTEMCTL" start "$UNIT"; then
+    return 0
+  fi
+
+  # Fallback when invoked as root (sudo path / manual debug).
+  if [[ -x "$WG_QUICK" ]] && [[ "$(id -u)" -eq 0 ]]; then
+    "$WG_QUICK" up "$WG_INTERFACE"
+    return 0
+  fi
+
+  echo "ERROR: failed to start $UNIT (is polkit rule installed?)" >&2
+  return 1
+}
+
+do_down() {
+  if [[ -x "$SYSTEMCTL" ]]; then
+    "$SYSTEMCTL" stop "$UNIT" >/dev/null 2>&1 || true
+  fi
+  if iface_up && [[ "$(id -u)" -eq 0 ]] && [[ -x "$WG_QUICK" ]]; then
+    "$WG_QUICK" down "$WG_INTERFACE" || true
+  fi
+}
+
+do_status() {
+  if iface_up; then
+    echo "active"
+    return 0
+  fi
+  echo "inactive"
+  return 1
 }
 
 case "$1" in
-  up)
-    if iface_up; then
-      echo "already up: $WG_INTERFACE"
-      exit 0
-    fi
-    "$WG_QUICK" up "$WG_INTERFACE"
-    ;;
-  down)
-    if iface_up; then
-      "$WG_QUICK" down "$WG_INTERFACE" || true
-    fi
-    ;;
-  status)
-    if iface_up; then
-      echo "active"
-      exit 0
-    fi
-    echo "inactive"
-    exit 1
-    ;;
-  *)
-    usage
-    ;;
+  up) do_up ;;
+  down) do_down ;;
+  status) do_status ;;
+  *) usage ;;
 esac

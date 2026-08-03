@@ -4,10 +4,10 @@
 # Launch Options (exact):
 #   /home/deck/bin/palworld-wg.sh %command%
 #
-# Brings WireGuard up (wg-quick), waits for the game host, runs Palworld,
-# then tears the tunnel down on exit (including crash / Force Quit).
+# Uses systemctl to start/stop wg-quick@wg0 (polkit). This avoids sudo, which
+# Steam Game Mode blocks via PR_SET_NO_NEW_PRIVS.
 #
-# If WireGuard fails to connect, Palworld still launches (offline / local play).
+# If WireGuard fails, Palworld still launches.
 set -euo pipefail
 
 CONF_CANDIDATES=(
@@ -20,12 +20,14 @@ WG_INTERFACE="wg0"
 WG_HOST="10.8.0.1"
 WAIT_SECONDS="30"
 CTL="${PALWORLD_WG_CTL:-/home/deck/bin/palworld-wg-ctl}"
-SUDO_BIN="${SUDO_BIN:-/usr/bin/sudo}"
+SYSTEMCTL="${SYSTEMCTL:-/usr/bin/systemctl}"
 IP_BIN="${IP_BIN:-/usr/sbin/ip}"
 [[ -x "$IP_BIN" ]] || IP_BIN="/bin/ip"
 [[ -x "$IP_BIN" ]] || IP_BIN="$(command -v ip || true)"
+WG_BIN="${WG_BIN:-/usr/bin/wg}"
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/palworld-wg"
 LOG="$LOG_DIR/launch.log"
+STATUS_FILE="$LOG_DIR/last-status"
 
 for conf in "${CONF_CANDIDATES[@]}"; do
   [[ -n "$conf" && -f "$conf" ]] || continue
@@ -34,14 +36,25 @@ for conf in "${CONF_CANDIDATES[@]}"; do
   break
 done
 
+UNIT="wg-quick@${WG_INTERFACE}.service"
 mkdir -p "$LOG_DIR"
 
 log() {
   printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG" >&2
 }
 
+write_status() {
+  printf '%s\n' "$*" >"$STATUS_FILE"
+}
+
 iface_up() {
   [[ -n "$IP_BIN" ]] && "$IP_BIN" link show "$WG_INTERFACE" >/dev/null 2>&1
+}
+
+nonewprivs() {
+  local v
+  v="$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status 2>/dev/null || echo unknown)"
+  printf '%s' "$v"
 }
 
 run_ctl() {
@@ -54,22 +67,9 @@ run_ctl() {
     return 127
   fi
 
-  if [[ ! -x "$SUDO_BIN" ]]; then
-    log "ERROR: sudo not found at $SUDO_BIN"
-    return 127
-  fi
-
-  # Capture stderr/stdout so Game Mode failures are visible in the log.
-  # env -i avoids Steam/Proton polluting sudo; keep a minimal PATH.
   set +e
-  out="$(
-    env -i \
-      HOME="/home/deck" \
-      USER="deck" \
-      LOGNAME="deck" \
-      PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-      "$SUDO_BIN" -n "$CTL" "$action" 2>&1
-  )"
+  # No sudo — ctl uses systemctl/polkit so Game Mode NO_NEW_PRIVS is OK.
+  out="$("$CTL" "$action" 2>&1)"
   rc=$?
   set -e
 
@@ -83,25 +83,50 @@ run_ctl() {
 }
 
 wg_up() {
+  log "NoNewPrivs=$(nonewprivs) (1 means Steam blocked sudo; systemctl path required)"
+
   if iface_up; then
     log "WireGuard already active: $WG_INTERFACE"
+    write_status "up (already active)"
     return 0
   fi
 
-  log "Bringing up WireGuard: $WG_INTERFACE"
+  log "Bringing up WireGuard via systemctl: $UNIT"
 
-  if run_ctl up; then
+  if run_ctl up && iface_up; then
+    if [[ -x "$WG_BIN" ]]; then
+      log "wg show: $("$WG_BIN" show "$WG_INTERFACE" 2>&1 | tr '\n' ' ')"
+    fi
+    write_status "up"
     return 0
   fi
 
+  # Last-resort Desktop fallback (will fail under Game Mode NO_NEW_PRIVS).
+  if [[ "$(nonewprivs)" != "1" ]] && [[ -x /usr/bin/sudo ]]; then
+    log "Trying sudo fallback (Desktop only)..."
+    set +e
+    out="$(/usr/bin/sudo -n /usr/bin/wg-quick up "$WG_INTERFACE" 2>&1)"
+    rc=$?
+    set -e
+    [[ -n "$out" ]] && log "sudo wg-quick output: $out"
+    if [[ $rc -eq 0 ]] && iface_up; then
+      write_status "up (sudo fallback)"
+      return 0
+    fi
+  fi
+
+  write_status "down (bring-up failed)"
   log "WARN: failed to bring up '$WG_INTERFACE'."
-  log "Check: /etc/wireguard/${WG_INTERFACE}.conf, sudoers (!requiretty), and: $SUDO_BIN -n $CTL up"
+  log "Install polkit rule 99-palworld-wg.rules and ensure systemctl start $UNIT works as deck."
   return 1
 }
 
 wg_down() {
   log "Bringing down WireGuard: $WG_INTERFACE"
   run_ctl down || true
+  if ! iface_up; then
+    write_status "down"
+  fi
 }
 
 host_reachable() {
@@ -146,7 +171,6 @@ fi
 
 trap cleanup EXIT INT TERM HUP
 
-# WireGuard is best-effort: never block the game from starting.
 if wg_up; then
   if ! wait_for_host; then
     log "WARN: WireGuard up but host not ready; launching Palworld anyway"

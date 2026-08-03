@@ -1,0 +1,31 @@
+/* Allow deck to start/stop WireGuard for Palworld without a password.
+ * Required in Game Mode: Steam sets NO_NEW_PRIVS, so sudo/setuid cannot work.
+ *
+ * Install:
+ *   sudo steamos-readonly disable
+ *   sudo cp 99-palworld-wg.rules /etc/polkit-1/rules.d/99-palworld-wg.rules
+ *   sudo chmod 644 /etc/polkit-1/rules.d/99-palworld-wg.rules
+ *   sudo steamos-readonly enable
+ */
+polkit.addRule(function (action, subject) {
+  if (subject.user !== "deck") {
+    return polkit.Result.NOT_HANDLED;
+  }
+
+  if (action.id !== "org.freedesktop.systemd1.manage-units") {
+    return polkit.Result.NOT_HANDLED;
+  }
+
+  var unit = action.lookup("unit");
+  var verb = action.lookup("verb");
+
+  if (unit !== "wg-quick@wg0.service") {
+    return polkit.Result.NOT_HANDLED;
+  }
+
+  if (verb === "start" || verb === "stop" || verb === "restart") {
+    return polkit.Result.YES;
+  }
+
+  return polkit.Result.NOT_HANDLED;
+});
