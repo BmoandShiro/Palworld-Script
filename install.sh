@@ -118,32 +118,35 @@ sudo install -m 644 -o root -g root -T "$SERVICE_SRC" "$SERVICE_DST"
 sudo systemctl disable --now palworld-wg-up.path palworld-wg-down.path 2>/dev/null || true
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now palworld-wg-monitor.service
+sudo systemctl enable palworld-wg-monitor.service
+# Always restart so an overwritten monitor script is picked up
+sudo systemctl restart palworld-wg-monitor.service
 
 sudo steamos-readonly enable || true
 
 echo "==> Service status:"
 systemctl --no-pager --full status palworld-wg-monitor.service | head -20 || true
 
+echo "==> Installed monitor version:"
+grep -m1 '^MONITOR_VERSION=' "$MONITOR_DST" || true
+
 echo
 echo "=============================================="
 echo " Install OK — monitor running"
 echo "=============================================="
 echo
-echo "IMPORTANT: Clear Palworld Launch Options in Steam"
+echo "IMPORTANT: Clear Launch Options for Palworld/Valheim in Steam"
 echo "  (leave the field EMPTY — no wrapper script)."
 echo
 echo "How it works:"
-echo "  Every 60s: Palworld running -> wg0 up; otherwise -> wg0 down"
+echo "  Every 60s: Palworld OR Valheim running -> wg0 up; else -> wg0 down"
 echo "  Starts automatically at boot."
 echo
-echo "Manual checks:"
-echo "  systemctl status palworld-wg-monitor.service"
+echo "While Valheim is open, verify detection:"
+echo "  pgrep -afi 'valheim\\.exe'"
 echo "  cat /home/deck/.local/state/palworld-wg/monitor-status"
-echo "  tail -30 /home/deck/.local/state/palworld-wg/monitor.log"
-echo "  sudo wg show"
+echo "  tail -20 /home/deck/.local/state/palworld-wg/monitor.log"
 echo
-echo "Then just press Play on Palworld (Desktop or Game Mode)."
-echo "Within ~1 minute WireGuard should come up; within ~1 minute"
-echo "after quit it should go down."
+echo "Expect status like: up game=yes via=valheim.exe"
+echo "Expect log: Game detected (valheim.exe) — bringing up wg0"
 echo
